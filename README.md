@@ -89,10 +89,10 @@ pip install customtkinter matplotlib networkx win10toast
 ---
 
 ## ▶️ How to Run
-1. Place `bccc.py` and this `README.md` in a folder.
+1. Place `blockchain_chat.py` and this `README.md` in a folder.
 2. Start the **first node** (no peers):
    ```bash
-   python bccc.py
+   python blockchain_chat.py
    ```
 3. In **Start Your Node**:
    - **Node Name:** e.g., `Node-A`
@@ -103,7 +103,7 @@ pip install customtkinter matplotlib networkx win10toast
 ### Add more nodes on the same machine
 Open new terminals and run:
 ```bash
-python bccc.py
+python blockchain_chat.py
 ```
 - For the second node: name `Node-B`, port `5002`, peers: `localhost:5001`
 - For a third: name `Node-C`, port `5003`, peers: `localhost:5001, localhost:5002`
