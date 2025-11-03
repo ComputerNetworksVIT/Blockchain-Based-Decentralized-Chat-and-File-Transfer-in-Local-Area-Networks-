@@ -19,6 +19,14 @@ SECURITY ENHANCEMENTS:
 - Rate limiting protection
 - Path traversal prevention
 - Bounded memory usage
+
+FIXES:
+- Fixed canvas scrolling mechanism
+- Fixed cross-network file tampering verification
+- Improved error handling throughout
+- Better thread synchronization
+- Enhanced file sync mechanism
+- Automatic periodic integrity checks
 """
 
 import os
@@ -34,7 +42,8 @@ import uuid
 import subprocess
 import platform
 import re
-from datetime import datetime
+import sys
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from collections import defaultdict, deque
 
@@ -50,6 +59,14 @@ try:
     from win10toast import ToastNotifier
 except Exception:
     ToastNotifier = None
+
+# Python version compatibility
+try:
+    # Python 3.11+
+    UTC = datetime.UTC
+except AttributeError:
+    # Python 3.10 and earlier
+    UTC = timezone.utc
 
 # ==================== Configuration ====================
 DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -67,6 +84,11 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB max file size
 RECV_TIMEOUT = 30.0  # Socket receive timeout
 CONNECT_TIMEOUT = 5.0  # Socket connect timeout
 MAX_REQUESTS_PER_MINUTE = 100  # Rate limit per peer
+
+# Verification settings
+VERIFICATION_INTERVAL = 60  # Automatic verification every 60 seconds
+HEARTBEAT_INTERVAL = 12  # Heartbeat every 12 seconds
+PEER_TIMEOUT = 30  # Consider peer inactive after 30 seconds
 
 # Color palette for peer identification
 COLORS = [
@@ -114,7 +136,8 @@ def load_peer_colors():
                 data = json.load(f)
                 if isinstance(data, dict):
                     peer_colors.update(data)
-        except Exception:
+        except Exception as e:
+            print(f"[warn] Could not load peer colors: {e}")
             peer_colors.clear()
             save_peer_colors()
 
@@ -164,7 +187,7 @@ def notify_user(title, msg):
             subprocess.run([
                 "osascript", "-e",
                 f'display notification "{safe_msg}" with title "{safe_title}"'
-            ], timeout=5)
+            ], timeout=5, stderr=subprocess.DEVNULL)
         elif SYSTEM == "windows" and WIN_NOTIFIER:
             WIN_NOTIFIER.show_toast(str(title)[:100], str(msg)[:200], duration=4, threaded=True)
         else:
@@ -299,7 +322,7 @@ class PerformanceAnalyzer:
     def _log_perf(self, tag, value, extra=None):
         """Log performance metrics to file"""
         try:
-            ts = datetime.utcnow().isoformat() + "Z"
+            ts = datetime.now(UTC).isoformat()
             with open(PERF_LOG_PATH, "a") as f:
                 if tag == "LATENCY":
                     f.write(f"{ts}\tLATENCY\t{value:.6f}\n")
@@ -478,6 +501,14 @@ class Node:
         self.pending_lock = threading.Lock()
         self.rate_limiter = RateLimiter(MAX_REQUESTS_PER_MINUTE)
         self.running = True
+        self.verify_results = {}
+        self.verify_lock = threading.Lock()
+        
+        # MESSAGE DEDUPLICATION SYSTEM
+        self.seen_messages = {}  # message_id -> timestamp
+        self.seen_lock = threading.Lock()
+        self.seen_cleanup_interval = 300  # Clean old entries every 5 minutes
+        self.message_ttl = 600  # Keep message IDs for 10 minutes
         
         self._server_thread = threading.Thread(target=self._server_loop, daemon=True)
         self._server_thread.start()
@@ -493,12 +524,184 @@ class Node:
 
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._heartbeat_thread.start()
+        
+        # FIXED: Add automatic verification thread
+        self._verification_thread = threading.Thread(target=self._verification_loop, daemon=True)
+        self._verification_thread.start()
+        
+        # Start seen messages cleanup thread
+        self._seen_cleanup_thread = threading.Thread(target=self._seen_cleanup_loop, daemon=True)
+        self._seen_cleanup_thread.start()
+    
+    def _generate_message_id(self, msg):
+        """Generate unique ID for message deduplication"""
+        msg_type = msg.get("type", "")
+        
+        # Different ID strategies for different message types
+        if msg_type == "CHAT":
+            tx = msg.get("tx", {})
+            return f"chat_{tx.get('tx_id', '')}_{tx.get('sender', '')}_{tx.get('sent_ts', '')}"
+        
+        elif msg_type == "BLOCK":
+            blk = msg.get("block", {})
+            return f"block_{blk.get('index', '')}_{blk.get('prev_hash', '')}"
+        
+        elif msg_type == "FILE_TRANSFER":
+            return f"file_{msg.get('tx_id', '')}_{msg.get('from', '')}"
+        
+        elif msg_type == "TAMPER_ALERT":
+            alert = msg.get("alert", {})
+            return f"tamper_{alert.get('filename', '')}_{alert.get('from', '')}_{alert.get('timestamp', '')}"
+        
+        elif msg_type == "TAMPER_CHECK_REQUEST":
+            file_info = msg.get("file_info", {})
+            return f"tampercheck_{file_info.get('filename', '')}_{msg.get('from', '')}"
+        
+        elif msg_type == "VERIFY_REQUEST":
+            return f"verify_{msg.get('from', '')}_{time.time()}"
+        
+        elif msg_type in ["HELLO", "HELLO_ACK"]:
+            return f"{msg_type}_{msg.get('host', '')}_{msg.get('port', '')}_{msg.get('name', '')}"
+        
+        else:
+            # Generic ID for other message types
+            return f"{msg_type}_{hashlib.md5(json.dumps(msg, sort_keys=True).encode()).hexdigest()}"
+    
+    def _is_duplicate_message(self, msg):
+        """Check if message has been seen before"""
+        msg_id = self._generate_message_id(msg)
+        
+        with self.seen_lock:
+            now = time.time()
+            
+            if msg_id in self.seen_messages:
+                # Message seen before
+                last_seen = self.seen_messages[msg_id]
+                
+                # If seen recently (within TTL), it's a duplicate
+                if now - last_seen < self.message_ttl:
+                    return True
+            
+            # Not a duplicate, record it
+            self.seen_messages[msg_id] = now
+            return False
+    
+    def _seen_cleanup_loop(self):
+        """Periodically clean up old message IDs"""
+        while self.running:
+            time.sleep(self.seen_cleanup_interval)
+            
+            with self.seen_lock:
+                now = time.time()
+                expired = [
+                    msg_id for msg_id, timestamp in self.seen_messages.items()
+                    if now - timestamp > self.message_ttl
+                ]
+                
+                for msg_id in expired:
+                    del self.seen_messages[msg_id]
+                
+                if expired:
+                    print(f"[dedup] Cleaned {len(expired)} old message IDs")
 
     def _heartbeat_loop(self):
+        """Send periodic heartbeats to maintain peer list"""
         while self.running:
-            time.sleep(12)
+            time.sleep(HEARTBEAT_INTERVAL)
             self.broadcast({"type": "PING", "name": self.name})
             enqueue_gui("clean_legend")
+    
+    def _verification_loop(self):
+        """Automatically verify file integrity periodically"""
+        while self.running:
+            time.sleep(VERIFICATION_INTERVAL)
+            try:
+                self._auto_verify_files()
+            except Exception as e:
+                print(f"[verification] error: {e}")
+
+    def _auto_verify_files(self):
+        """Automatically verify all files and alert on tampering"""
+        chain_copy = self.chain.get_chain_copy()
+        file_txs = []
+        
+        for b in chain_copy:
+            for tx in b.txs:
+                if isinstance(tx, dict) and tx.get("kind") == "file":
+                    file_txs.append((b.index, tx))
+        
+        if not file_txs:
+            return
+        
+        for block_idx, tx in file_txs:
+            fname = tx.get("filename")
+            expected_hash = tx.get("file_hash")
+            
+            if not fname or not expected_hash:
+                continue
+            
+            local_path = os.path.join(DOWNLOADS, fname)
+            
+            # Check if file exists
+            if not os.path.exists(local_path):
+                enqueue_gui("print", f"⚠️ Missing file detected: {fname}")
+                # Request file from network
+                self._request_file_from_network(fname, expected_hash)
+                continue
+            
+            # Check file integrity
+            try:
+                with open(local_path, "rb") as f:
+                    actual_hash = hashlib.sha256(f.read()).hexdigest()
+                
+                if actual_hash != expected_hash:
+                    # TAMPERING DETECTED!
+                    enqueue_gui("print", f"🚨 TAMPERING DETECTED: {fname}")
+                    enqueue_gui("notify", "File Tampered!", f"{fname} has been modified")
+                    
+                    # Broadcast tamper alert
+                    alert_data = {
+                        "filename": fname,
+                        "expected_hash": expected_hash,
+                        "actual_hash": actual_hash,
+                        "block_index": block_idx,
+                        "from": self.name,
+                        "timestamp": time.time()
+                    }
+                    self.broadcast_tamper_alert(alert_data)
+                    
+                    # Request network verification
+                    self._request_network_file_verification(fname, expected_hash)
+                    
+            except Exception as e:
+                enqueue_gui("print", f"⚠️ Error checking {fname}: {e}")
+
+    def _request_file_from_network(self, fname, expected_hash):
+        """Request a missing file from the network"""
+        payload = {
+            "type": "FILE_SYNC_REQUEST",
+            "filename": fname,
+            "expected_hash": expected_hash,
+            "from": f"{self.host}:{self.port}"
+        }
+        self.broadcast(payload)
+        enqueue_gui("print", f"📡 Requesting {fname} from network")
+
+    def _request_network_file_verification(self, fname, expected_hash):
+        """Ask all peers to verify a specific file"""
+        file_info = {
+            "filename": fname,
+            "expected_hash": expected_hash
+        }
+        
+        payload = {
+            "type": "TAMPER_CHECK_REQUEST",
+            "file_info": file_info,
+            "from": f"{self.host}:{self.port}"
+        }
+        
+        self.broadcast(payload)
+        enqueue_gui("print", f"🔍 Requesting network verification for {fname}")
 
     def _hello_peers(self):
         """Send HELLO message to all peers"""
@@ -606,6 +809,12 @@ class Node:
     def _handle(self, msg, addr):
         """Handle incoming message based on type"""
         if not isinstance(msg, dict):
+            return
+        
+        # DEDUPLICATION CHECK - Reject duplicate messages
+        if self._is_duplicate_message(msg):
+            msg_type = msg.get("type", "unknown")
+            print(f"[dedup] Dropped duplicate {msg_type} message from {addr}")
             return
         
         t = msg.get("type")
@@ -856,6 +1065,8 @@ class Node:
         
         elif t == "TAMPER_CHECK_REQUEST":
             file_info = msg.get("file_info")
+            requester = msg.get("from")
+            
             if file_info and isinstance(file_info, dict):
                 result = self._verify_specific_file(file_info)
                 resp = {
@@ -864,21 +1075,37 @@ class Node:
                     "file_info": file_info,
                     "result": result
                 }
-                threading.Thread(
-                    target=send_json,
-                    args=(addr[0], addr[1], resp),
-                    daemon=True
-                ).start()
+                
+                try:
+                    if requester:
+                        req_host, req_port = requester.split(":")
+                        threading.Thread(
+                            target=send_json,
+                            args=(req_host, int(req_port), resp),
+                            daemon=True
+                        ).start()
+                    else:
+                        threading.Thread(
+                            target=send_json,
+                            args=(addr[0], addr[1], resp),
+                            daemon=True
+                        ).start()
+                except Exception as e:
+                    print(f"[error] TAMPER_CHECK_REQUEST response: {e}")
         
         elif t == "TAMPER_CHECK_RESPONSE":
-            enqueue_gui("tamper_check_response", msg.get("from"), msg.get("file_info"), msg.get("result"))
+            enqueue_gui("tamper_check_response", 
+                       msg.get("from"), 
+                       msg.get("file_info"), 
+                       msg.get("result"))
         
         elif t == "FILE_SYNC_REQUEST":
             fname = msg.get("filename")
+            expected_hash = msg.get("expected_hash")
             requester = msg.get("from")
             
             if fname and requester:
-                self._send_file_to_peer(fname, requester)
+                self._send_file_to_peer(fname, expected_hash, requester)
         
         elif t == "FILE_SYNC_RESPONSE":
             try:
@@ -1026,7 +1253,7 @@ class Node:
         except Exception as e:
             return {"status": "error", "message": str(e)}
     
-    def _send_file_to_peer(self, fname, requester):
+    def _send_file_to_peer(self, fname, expected_hash, requester):
         """Send a file to a peer for synchronization"""
         try:
             local_path = os.path.join(DOWNLOADS, fname)
@@ -1043,6 +1270,11 @@ class Node:
                 return
             
             file_hash = hashlib.sha256(data).hexdigest()
+            
+            # Verify we have the correct file before sending
+            if expected_hash and file_hash != expected_hash:
+                enqueue_gui("print", f"[sync] Our copy of {fname} is also tampered, cannot send")
+                return
             
             payload = {
                 "type": "FILE_SYNC_RESPONSE",
@@ -1268,35 +1500,14 @@ class App:
         )
         self.scroll_btn.pack(side="right")
         
-        # Create a frame with both scrollbar and canvas for proper scrolling
-        self.chat_scroll_frame = ctk.CTkFrame(chat_container, fg_color="transparent")
+        # FIXED: Create scrollable frame with proper configuration
+        self.chat_scroll_frame = ctk.CTkScrollableFrame(
+            chat_container,
+            fg_color="transparent",
+            scrollbar_button_color=("#3b3b3b", "#2b2b2b"),
+            scrollbar_button_hover_color=("#4a4a4a", "#3a3a3a")
+        )
         self.chat_scroll_frame.pack(fill="both", expand=True, padx=15, pady=(5, 15))
-        
-        # Create canvas and scrollbar manually for better control
-        self.chat_canvas = ctk.CTkCanvas(
-            self.chat_scroll_frame, 
-            bg="#1a1a1a",
-            highlightthickness=0
-        )
-        self.chat_scrollbar = ctk.CTkScrollbar(
-            self.chat_scroll_frame, 
-            orientation="vertical", 
-            command=self.chat_canvas.yview
-        )
-        self.chat_canvas.configure(yscrollcommand=self.chat_scrollbar.set)
-        
-        self.chat_frame = ctk.CTkFrame(self.chat_canvas, fg_color="transparent")
-        self.chat_frame_id = self.chat_canvas.create_window((0, 0), window=self.chat_frame, anchor="nw")
-        
-        # Pack canvas and scrollbar
-        self.chat_canvas.pack(side="left", fill="both", expand=True)
-        self.chat_scrollbar.pack(side="right", fill="y")
-        
-        # Bind events for proper scrolling
-        self.chat_frame.bind("<Configure>", self._on_frame_configure)
-        self.chat_canvas.bind("<Configure>", self._on_canvas_configure)
-        self.chat_canvas.bind('<Enter>', self._bind_mousewheel)
-        self.chat_canvas.bind('<Leave>', self._unbind_mousewheel)
         
         # Enhanced input area
         input_container = ctk.CTkFrame(main_container, fg_color="transparent")
@@ -1384,6 +1595,18 @@ class App:
         
         ctk.CTkButton(
             btn_container, 
+            text="🔍 Verify Network", 
+            width=125, 
+            height=35,
+            font=("Arial", 11),
+            fg_color=("#6a4c93", "#5a3c83"),
+            hover_color=("#7a5ca3", "#6a4c93"),
+            corner_radius=8,
+            command=self._verify_network
+        ).pack(side="left", padx=3)
+        
+        ctk.CTkButton(
+            btn_container, 
             text="🛠 Fix Files", 
             width=115, 
             height=35,
@@ -1422,7 +1645,7 @@ class App:
         self.loss_label = ctk.CTkLabel(loss_card, text="0%", font=("Arial", 18, "bold"))
         self.loss_label.pack(pady=(0, 8))
         
-        # FIXED: Enhanced peer legend with proper visibility
+        # Enhanced peer legend with proper visibility
         legend_frame = ctk.CTkFrame(main_container, fg_color=("#2b2b2b", "#1a1a1a"), corner_radius=10, height=85)
         legend_frame.pack(fill="x", pady=(5, 0))
         legend_frame.pack_propagate(False)
@@ -1456,53 +1679,29 @@ class App:
         self.root.after(80, self._process_gui_queue)
         self.root.after(200, self._show_start_dialog)
     
-    def _on_frame_configure(self, event=None):
-        """Update scrollregion when frame size changes"""
-        self.chat_canvas.configure(scrollregion=self.chat_canvas.bbox("all"))
-    
-    def _on_canvas_configure(self, event=None):
-        """Update inner frame width when canvas size changes"""
-        self.chat_canvas.itemconfig(self.chat_frame_id, width=event.width)
-    
-    def _bind_mousewheel(self, event):
-        """Bind mousewheel to canvas"""
-        self.chat_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-    
-    def _unbind_mousewheel(self, event):
-        """Unbind mousewheel from canvas"""
-        self.chat_canvas.unbind_all("<MouseWheel>")
-    
-    def _on_mousewheel(self, event):
-        """Handle mousewheel scrolling"""
-        self.chat_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-    
     def _scroll_to_bottom(self):
         """Scroll chat to bottom - FIXED VERSION"""
         try:
-            # Update the scroll region first
-            self.chat_canvas.update_idletasks()
+            # Force update to get correct canvas size
+            self.chat_scroll_frame.update_idletasks()
             
-            # Get the bounding box of all items in canvas
-            bbox = self.chat_canvas.bbox("all")
-            if bbox:
-                # Scroll to the bottom of the canvas
-                self.chat_canvas.yview_moveto(1.0)
-                
-                # Force update to ensure scrolling happens
-                self.chat_canvas.update_idletasks()
+            # Scroll to bottom using the internal canvas
+            self.chat_scroll_frame._parent_canvas.yview_moveto(1.0)
+            
         except Exception as e:
             print(f"[scroll] error: {e}")
 
     def _clean_legend(self):
+        """Remove inactive peers from legend"""
         with lock:
             now = time.time()
-            dead = [n for n, t in active_peers.items() if now - t > 30]
+            dead = [n for n, t in active_peers.items() if now - t > PEER_TIMEOUT]
             for n in dead:
                 active_peers.pop(n, None)
         enqueue_gui("update_legend")
 
     def _render_legend(self):
-        """FIXED: Render active peers in the legend with proper layout"""
+        """Render active peers in the legend with proper layout"""
         try:
             # Clear the legend scroll frame
             for widget in self.legend_scroll_frame.winfo_children():
@@ -1581,17 +1780,23 @@ class App:
             print(f"[legend] render error: {e}")
 
     def _check_files_intuitive(self):
+        """Check file integrity and offer sync options"""
         if not self.node:
             messagebox.showwarning("Not Connected", "Start a node first!")
             return
+        
         win = ctk.CTkToplevel(self.root)
         win.title("File Health & Sync")
         win.geometry("880x680")
+        
         txt = ctk.CTkTextbox(win, font=("Consolas", 11))
         txt.pack(fill="both", expand=True, padx=15, pady=15)
+        
         files = [tx for b in self.node.chain.get_chain_copy() for tx in b.txs if tx.get("kind") == "file"]
         txt.insert("end", f"Scanning {len(files)} file(s)...\n\n")
+        
         ok = tampered = missing = 0
+        
         for f in files:
             path = os.path.join(DOWNLOADS, f["filename"])
             if not os.path.exists(path):
@@ -1610,6 +1815,7 @@ class App:
                 except Exception as e:
                     txt.insert("end", f"❌ ERROR: {f['filename']} ({e})\n")
                     missing += 1
+        
         txt.insert("end", f"\n{'='*70}\n")
         txt.insert("end", f"SUMMARY: {ok} OK | {tampered} TAMPERED | {missing} MISSING\n")
         
@@ -1629,6 +1835,7 @@ class App:
                         self.node.broadcast({
                             "type": "FILE_SYNC_REQUEST",
                             "filename": f["filename"],
+                            "expected_hash": f["file_hash"],
                             "from": f"{self.node.host}:{self.node.port}"
                         })
                 except Exception:
@@ -1639,8 +1846,41 @@ class App:
         btn = ctk.CTkButton(win, text="🔧 Fix All Problems", fg_color=ALERT_COLOR, command=fix_all)
         if tampered + missing > 0:
             btn.pack(pady=12)
+    
+    def _verify_network(self):
+        """Initiate network-wide verification and display results"""
+        if not self.node:
+            messagebox.showwarning("Not Connected", "Start a node first!")
+            return
+        
+        win = ctk.CTkToplevel(self.root)
+        win.title("Network Verification")
+        win.geometry("800x600")
+        
+        txt = ctk.CTkTextbox(win, font=("Consolas", 11))
+        txt.pack(fill="both", expand=True, padx=15, pady=15)
+        
+        txt.insert("end", "🔍 Starting network-wide verification...\n\n")
+        
+        # Get local results
+        local_result = self.node._local_verify_report()
+        txt.insert("end", f"LOCAL NODE ({self.node.name}):\n")
+        
+        if local_result["ok"]:
+            txt.insert("end", "  ✅ All checks passed\n")
+        else:
+            txt.insert("end", f"  ⚠️ Found {len(local_result['issues'])} issue(s):\n")
+            for issue in local_result["issues"]:
+                txt.insert("end", f"    • {issue}\n")
+        
+        txt.insert("end", "\n" + "="*70 + "\n")
+        txt.insert("end", "Requesting verification from peers...\n\n")
+        
+        # Request verification from all peers
+        self.node.verify_network()
 
     def _show_blockchain_navigator(self):
+        """Display blockchain structure with interactive viewer"""
         if not self.node:
             messagebox.showwarning("No Chain", "Start a node first!")
             return
@@ -1723,9 +1963,10 @@ class App:
         win.after(3000, refresh)
 
     def _show_start_dialog(self):
+        """Display node configuration dialog"""
         dialog = ctk.CTkToplevel(self.root)
         dialog.title("🚀 Start Your Node")
-        dialog.geometry("500x450")
+        dialog.geometry("500x550")
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -1787,25 +2028,25 @@ class App:
         # Peer Address
         ctk.CTkLabel(
             content, 
-            text="Connect to Peer (Optional)", 
+            text="Connect to Peers (Optional)", 
             font=("Arial", 12, "bold"),
             anchor="w"
         ).pack(fill="x", pady=(5, 5))
         
-        peer_entry = ctk.CTkEntry(
+        peer_entry = ctk.CTkTextbox(
             content, 
             width=440, 
-            height=40,
-            placeholder_text="e.g., 192.168.1.100:5001",
+            height=80,
             font=("Arial", 12),
             corner_radius=8,
             border_width=2
         )
         peer_entry.pack(pady=(0, 5))
+        peer_entry.insert("1.0", "# Enter peer addresses (one per line or comma-separated)\n# Examples:\n# 192.168.1.100:5001\n# localhost:5001, localhost:5002\n")
         
         ctk.CTkLabel(
             content,
-            text="💡 Leave empty to start as first node",
+            text="💡 Leave empty to start as first node | Enter multiple peers to join network",
             font=("Arial", 10, "italic"),
             text_color="#888",
             anchor="w"
@@ -1813,7 +2054,7 @@ class App:
         
         def start_node():
             port_str = port_entry.get().strip()
-            peer_str = peer_entry.get().strip()
+            peer_text = peer_entry.get("1.0", "end").strip()
             name = name_entry.get().strip() or None
             
             try:
@@ -1825,13 +2066,32 @@ class App:
                 return
             
             peers = []
-            if peer_str:
-                try:
-                    host, pport = peer_str.split(":")
-                    peers.append((host.strip(), int(pport.strip())))
-                except:
-                    messagebox.showerror("Invalid Peer", "Format must be: host:port")
-                    return
+            if peer_text:
+                # Remove comments and empty lines
+                lines = [line.strip() for line in peer_text.split('\n') 
+                        if line.strip() and not line.strip().startswith('#')]
+                
+                # Process each line (can contain comma-separated peers)
+                for line in lines:
+                    # Split by comma for comma-separated peers on same line
+                    peer_addrs = [p.strip() for p in line.split(',') if p.strip()]
+                    
+                    for peer_addr in peer_addrs:
+                        try:
+                            if ':' in peer_addr:
+                                host, pport = peer_addr.split(':', 1)
+                                peers.append((host.strip(), int(pport.strip())))
+                            else:
+                                messagebox.showerror("Invalid Peer", 
+                                    f"Invalid format: {peer_addr}\nExpected: host:port")
+                                return
+                        except ValueError:
+                            messagebox.showerror("Invalid Peer", 
+                                f"Invalid port in: {peer_addr}\nPort must be a number")
+                            return
+                
+                # Remove duplicates while preserving order
+                peers = list(dict.fromkeys(peers))
             
             try:
                 self.node = Node("0.0.0.0", port, peers, name)
@@ -1840,7 +2100,16 @@ class App:
                     text_color="#99ff99"
                 )
                 dialog.destroy()
-                enqueue_gui("print", f"Node started successfully on port {port}")
+                
+                peer_count = len(peers)
+                if peer_count == 0:
+                    enqueue_gui("print", f"✅ Node started successfully on port {port} (First node)")
+                elif peer_count == 1:
+                    enqueue_gui("print", f"✅ Node started on port {port}, connecting to 1 peer")
+                else:
+                    enqueue_gui("print", f"✅ Node started on port {port}, connecting to {peer_count} peers")
+                
+                enqueue_gui("print", f"🔍 Automatic file verification enabled (every {VERIFICATION_INTERVAL}s)")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to start node:\n{e}")
         
@@ -1857,6 +2126,7 @@ class App:
         ).pack(fill="x", pady=(10, 0))
 
     def _on_closing(self):
+        """Cleanup on window close"""
         if self.node:
             self.node.shutdown()
         if self.animation:
@@ -1868,6 +2138,7 @@ class App:
         self.root.destroy()
 
     def _send_chat(self):
+        """Send chat message"""
         if not self.node:
             messagebox.showwarning("Not Connected", "Start a node first!")
             return
@@ -1878,6 +2149,7 @@ class App:
             self.entry.delete(0, "end")
 
     def _send_file(self):
+        """Send file to network"""
         if not self.node:
             messagebox.showwarning("Not Connected", "Start a node first!")
             return
@@ -1887,8 +2159,9 @@ class App:
             threading.Thread(target=self.node.send_file, args=(path,), daemon=True).start()
 
     def _print_console(self, msg):
+        """Print system message to console"""
         frame = ctk.CTkFrame(
-            self.chat_frame, 
+            self.chat_scroll_frame, 
             fg_color=("#e9c46a", "#d4af37"), 
             corner_radius=10,
             border_width=1,
@@ -1906,6 +2179,10 @@ class App:
             icon = "❌"
         elif "🔄" in msg or "SYNC" in msg:
             icon = "🔄"
+        elif "🚨" in msg or "TAMPER" in msg or "ALERT" in msg:
+            icon = "🚨"
+        elif "🔍" in msg or "verify" in msg.lower() or "check" in msg.lower():
+            icon = "🔍"
         
         label = ctk.CTkLabel(
             frame, 
@@ -1919,12 +2196,13 @@ class App:
         label.pack(pady=7, padx=12, fill="x")
         
         # Auto-scroll after adding message
-        self.root.after(100, self._scroll_to_bottom)
+        self.root.after(50, self._scroll_to_bottom)
 
     def _add_bubble(self, text, is_self, sender_name):
+        """Add chat bubble to UI"""
         bubble_color = peer_colors.get(sender_name, SELF_COLOR if is_self else "#555")
         
-        frame = ctk.CTkFrame(self.chat_frame, fg_color="transparent")
+        frame = ctk.CTkFrame(self.chat_scroll_frame, fg_color="transparent")
         frame.pack(fill="x", pady=5, padx=10)
         
         # Enhanced bubble with shadow effect
@@ -1986,9 +2264,10 @@ class App:
             time_label.pack(anchor="e", padx=14, pady=(0, 8))
         
         # Auto-scroll after adding bubble
-        self.root.after(100, self._scroll_to_bottom)
+        self.root.after(50, self._scroll_to_bottom)
 
     def _update_metrics(self):
+        """Update performance metrics display"""
         lat = perf.avg_latency() * 1000.0
         thr = perf.avg_throughput() / 1024.0
         loss = perf.packet_loss_rate()
@@ -2003,6 +2282,7 @@ class App:
         self.loss_label.configure(text=f"{loss:.2f}%", text_color=loss_color)
 
     def _show_graph(self):
+        """Display live performance graphs"""
         if not self.node:
             messagebox.showwarning("Not Connected", "Start a node first!")
             return
@@ -2059,6 +2339,7 @@ class App:
         canvas.draw()
 
     def _process_gui_queue(self):
+        """Process GUI update queue"""
         try:
             processed = 0
             while processed < 50:
@@ -2094,6 +2375,7 @@ class App:
             self.root.after(100, self._process_gui_queue)
 
     def _handle_verify_response(self, from_peer, result):
+        """Handle network verification response"""
         if not isinstance(result, dict):
             return
         
@@ -2103,23 +2385,28 @@ class App:
         issues = result.get("issues", [])
         
         status = "✅ OK" if ok else f"⚠️ {len(issues)} issue(s)"
-        self._print_console(f"Verify response from {from_peer}: {status}")
+        self._print_console(f"🔍 Verify response from {from_peer}: {status}")
         
         if issues:
             for issue in issues[:5]:
                 self._print_console(f"  • {issue}")
 
     def _handle_tamper_alert(self, alert_data):
+        """Handle tamper alert from network"""
         if not isinstance(alert_data, dict):
             return
         
         fname = alert_data.get("filename", "Unknown")
         from_peer = alert_data.get("from", "Unknown")
+        expected = alert_data.get("expected_hash", "")[:16]
+        actual = alert_data.get("actual_hash", "")[:16]
         
-        self._print_console(f"🚨 TAMPER ALERT: {fname} reported by {from_peer}")
-        notify_user("Tamper Alert", f"{fname} may be compromised")
+        self._print_console(f"🚨 TAMPER ALERT from {from_peer}: {fname}")
+        self._print_console(f"   Expected: {expected}... | Actual: {actual}...")
+        notify_user("Tamper Alert!", f"{fname} reported by {from_peer}")
 
     def _handle_tamper_check_response(self, from_peer, file_info, result):
+        """Handle tamper check response from peer"""
         if not isinstance(result, dict) or not isinstance(file_info, dict):
             return
         
@@ -2130,12 +2417,17 @@ class App:
             self._print_console(f"✅ {from_peer} confirms {fname} is valid")
         elif status == "tampered":
             self._print_console(f"⚠️ {from_peer} reports {fname} is TAMPERED")
+            expected = result.get("expected", "")[:16]
+            actual = result.get("actual", "")[:16]
+            self._print_console(f"   Expected: {expected}... | Got: {actual}...")
         elif status == "missing":
             self._print_console(f"❌ {from_peer} doesn't have {fname}")
         else:
-            self._print_console(f"❓ {from_peer} error checking {fname}")
+            error_msg = result.get("message", "Unknown error")
+            self._print_console(f"❓ {from_peer} error checking {fname}: {error_msg}")
 
     def run(self):
+        """Start the GUI application"""
         self.root.mainloop()
 
 
