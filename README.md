@@ -6,7 +6,7 @@ Now with **message deduplication**, **tamper-alert cooldowns**, faster UI dispat
 
 ---
 
-## 🚀 Overview / Introduction (Revised for Computer Network Emphasis)
+## 🚀 Introduction 
 
 This application is a **Blockchain-Based Decentralized Chat and File Transfer System** designed to demonstrate how **Computer Network principles** can be applied to achieve secure and resilient peer-to-peer (P2P) communication across a **Local Area Network (LAN)**.  
 
@@ -257,8 +257,8 @@ This system offers a practical exploration of Computer Network protocols, peer c
 ---
 
 ## 👨‍💻 Authors
-**Ilangkumaran Yogamani** — *ilangkumaran.2024@vitstudent.ac.in*  
-**Ranen Abner** — *ranen.abner2024@vitstudent.ac.in*
+**Ilangkumaran Yogamani(24BCE5537)** — *ilangkumaran.2024@vitstudent.ac.in*  
+**Ranen Abner(24BCE1185)** — *ranen.abner2024@vitstudent.ac.in*
 
 ---
 
